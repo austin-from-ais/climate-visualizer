@@ -62,8 +62,8 @@
 <body>
 <main>
   <h1>Hurricane Impact Visualizer</h1>
-  <p class="sub">Type a Florida address. We pull an aerial image of the property, then an
-    image model re-imagines the same scene after a hurricane.</p>
+  <p class="sub">Type a Florida address. We pull the Google Street View photo of the property, then
+    an image model re-imagines the same scene after a hurricane.</p>
 
   <form id="form">
     <div class="full">
@@ -96,6 +96,12 @@
       <div class="hint">Stays in this browser tab and is sent only to api.openai.com. It is
         not stored or logged anywhere.</div>
     </div>
+    <div class="full">
+      <label for="gkey">Google Maps API key</label>
+      <input id="gkey" type="password" autocomplete="off" placeholder="AIza...">
+      <div class="hint">Needs the Street View Static API enabled; sent only to Google. Leave it
+        blank to use a free aerial satellite view instead.</div>
+    </div>
     <div class="full"><button id="go" type="submit">Show hurricane impact</button></div>
   </form>
 
@@ -103,7 +109,7 @@
 
   <div class="results">
     <figure>
-      <div class="frame" id="before">The aerial image will appear here.</div>
+      <div class="frame" id="before">The photo of the property will appear here.</div>
       <figcaption><span id="beforeCap">Today</span></figcaption>
     </figure>
     <figure>
@@ -114,14 +120,27 @@
 
   <footer>
     The "after" image is an AI-generated illustration, not a forecast or a damage assessment
-    for this property. Geocoding and imagery: Esri, Maxar, Earthstar Geographics, and the GIS
-    User Community.
+    for this property. Street-level imagery: Google Street View. Geocoding and aerial imagery: Esri, Maxar,
+    Earthstar Geographics, and the GIS User Community.
   </footer>
 </main>
 
 <script>
 const $ = id => document.getElementById(id);
 const ZOOM = 19, CROP = 400, OUT = 1024;
+
+const VIEW = {
+  street: {
+    scene: "a real street-level photograph of a house or building in Florida",
+    keep: "from the same viewpoint, keeping the same building, architecture, street and framing",
+    style: "Photorealistic documentary photo under a grey overcast post-storm sky."
+  },
+  aerial: {
+    scene: "a real aerial satellite photograph of a property and its surroundings in Florida",
+    keep: "from the same overhead viewpoint, keeping the same buildings, roads, lot layout and framing",
+    style: "Photorealistic aerial post-storm survey imagery under overcast light."
+  }
+};
 
 const DAMAGE = {
   1: "minor damage: some missing roof shingles, broken tree branches and palm fronds scattered across yards and the street, a few downed fences, shallow puddles of standing water",
@@ -156,6 +175,19 @@ function loadTile(z, x, y) {
   });
 }
 
+// Fetches the Street View photo facing the address. Returns null if there is no coverage.
+async function captureStreetView(address, gkey) {
+  const q = "location=" + encodeURIComponent(address) + "&source=outdoor&key=" + encodeURIComponent(gkey);
+  const base = "https://maps.googleapis.com/maps/api/streetview";
+  const meta = await (await fetch(base + "/metadata?" + q)).json();
+  if (meta.status === "ZERO_RESULTS" || meta.status === "NOT_FOUND") return null;
+  if (meta.status !== "OK")
+    throw new Error("Google Street View: " + (meta.error_message || meta.status));
+  const res = await fetch(base + "?size=640x640&fov=80&return_error_code=true&" + q);
+  if (!res.ok) throw new Error("Google Street View: " + ((await res.text()) || res.status));
+  return res.blob();
+}
+
 // Stitches satellite tiles around the point and returns a square PNG blob.
 async function captureAerial(lat, lon) {
   const n = 2 ** ZOOM;
@@ -181,17 +213,17 @@ async function captureAerial(lat, lon) {
   return new Promise(r => canvas.toBlob(r, "image/png"));
 }
 
-async function reimagine(blob, category, key, model) {
+async function reimagine(blob, view, category, key, model) {
+  const v = VIEW[view];
   const prompt =
-    "This is a real aerial satellite photograph of a property and its surroundings in Florida. " +
-    "Re-render this exact scene from the same overhead viewpoint, keeping the same buildings, " +
-    "roads, lot layout and framing, but show it in the immediate aftermath of a Category " +
+    "This is " + v.scene + ". Re-render this exact scene " + v.keep +
+    ", but show it in the immediate aftermath of a Category " +
     category + " hurricane, with " + DAMAGE[category] + ". " +
-    "Photorealistic aerial post-storm survey imagery under overcast light. No text, labels or people.";
+    v.style + " No text, labels or people.";
 
   const body = new FormData();
   body.append("model", model);
-  body.append("image", blob, "property.png");
+  body.append("image", blob, blob.type === "image/jpeg" ? "property.jpg" : "property.png");
   body.append("prompt", prompt);
   body.append("size", "1024x1024");
   if (model.startsWith("gpt-image")) body.append("quality", "medium");
@@ -219,6 +251,7 @@ $("form").addEventListener("submit", async e => {
   e.preventDefault();
   const address = $("address").value.trim();
   const key = $("key").value.trim();
+  const gkey = $("gkey").value.trim();
   const model = $("model").value.trim() || "gpt-image-1";
   const category = $("category").value;
   $("go").disabled = true;
@@ -229,14 +262,24 @@ $("form").addEventListener("submit", async e => {
     setStatus("Looking up the address…");
     const place = await geocode(address);
 
-    setStatus("Capturing aerial imagery…");
-    const blob = await captureAerial(place.lat, place.lon);
-    showImage($("before"), URL.createObjectURL(blob), "Aerial image of " + place.label);
+    let blob = null, view = "street", note = "";
+    if (gkey) {
+      setStatus("Fetching the Street View photo…");
+      blob = await captureStreetView(place.label || address, gkey);
+      if (!blob) note = "No Street View coverage here, so this uses the aerial view. ";
+    }
+    if (!blob) {
+      view = "aerial";
+      setStatus(note + "Capturing aerial imagery…");
+      blob = await captureAerial(place.lat, place.lon);
+    }
+    showImage($("before"), URL.createObjectURL(blob),
+      (view === "street" ? "Street View photo of " : "Aerial image of ") + place.label);
     $("beforeCap").textContent = "Today — " + place.label;
 
-    setStatus("Generating the Category " + category + " scenario. This usually takes 30–90 seconds…");
+    setStatus(note + "Generating the Category " + category + " scenario. This usually takes 30–90 seconds…");
     $("after").innerHTML = '<div><div class="spinner"></div>Generating…</div>';
-    const src = await reimagine(blob, category, key, model);
+    const src = await reimagine(blob, view, category, key, model);
     showImage($("after"), src, "AI illustration of the property after a Category " + category + " hurricane");
     $("afterCap").textContent = "After a Category " + category + " hurricane (AI illustration)";
     $("dl").href = src; $("dl").hidden = false;
